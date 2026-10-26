@@ -131,12 +131,13 @@ function prepareOptions(model: RuntimeInfo, pkg: string) {
   }
 
   const customFetch = options.fetch
-  const transport = options.transport
+  const transport = options.transport ?? (options.websocket === true ? "websocket" : undefined)
   const timeouts = Provider.timeouts(options)
   delete options.headerTimeout
   delete options.chunkTimeout
   delete options.compaction
   delete options.transport
+  delete options.websocket
   options.fetch = async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const opts = { ...(init ?? {}) }
     // A plain AbortSignal.timeout would keep running into the body stream, so the header limit uses

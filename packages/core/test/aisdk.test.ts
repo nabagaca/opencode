@@ -163,11 +163,14 @@ copilotFinishes.forEach(({ normalized, reason }) =>
         event.language = event.sdk.responses("api-model")
       })
       const resolved = yield* aisdk.model({
-        ...model("@ai-sdk/github-copilot", {
-          baseURL: server.url.origin,
-          apiKey: "test",
-          transport: "websocket",
-        }),
+        ...model(
+          "@ai-sdk/github-copilot",
+          Provider.modelSettings({
+            baseURL: server.url.origin,
+            apiKey: "test",
+            websocket: true,
+          }),
+        ),
         providerID: Provider.ID.githubCopilot,
       })
       const response = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" }), {

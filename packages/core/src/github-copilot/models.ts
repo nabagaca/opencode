@@ -164,7 +164,7 @@ function build(id: Model.ID, remote: UsableModel, baseURL: string, previous?: Mo
       baseURL: messages ? `${baseURL}/v1` : baseURL,
       ...(endpoint ? { endpoint } : {}),
       ...(endpoint === "responses" && remote.supported_endpoints?.includes("ws:/responses")
-        ? { transport: previous?.settings?.transport ?? "websocket" }
+        ? { websocket: previous?.settings?.websocket ?? true }
         : {}),
     }),
     headers: previous?.headers,

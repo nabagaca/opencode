@@ -4,8 +4,8 @@ import { Model } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
 
 test.each([
-  { endpoints: ["/responses", "ws:/responses"], override: undefined, expected: "websocket" },
-  { endpoints: ["/responses", "ws:/responses"], override: "http", expected: "http" },
+  { endpoints: ["/responses", "ws:/responses"], override: undefined, expected: true },
+  { endpoints: ["/responses", "ws:/responses"], override: false, expected: false },
   { endpoints: ["/responses"], override: undefined, expected: undefined },
   { endpoints: ["/v1/messages", "/responses", "ws:/responses"], override: undefined, expected: undefined },
 ])("selects advertised Responses transport ($endpoints, $override)", async ({ endpoints, override, expected }) => {
@@ -32,10 +32,10 @@ test.each([
   try {
     const previous = Model.Info.make({
       ...Model.Info.default(Provider.ID.githubCopilot, Model.ID.make("model")),
-      settings: override ? { transport: override } : {},
+      settings: override === undefined ? {} : { websocket: override },
     })
     const models = await CopilotModels.get(server.url.origin, {}, [previous])
-    expect(models.get(Model.ID.make("model"))?.settings?.transport).toBe(expected)
+    expect(Provider.modelSettings(models.get(Model.ID.make("model"))?.settings)?.websocket).toBe(expected)
   } finally {
     await server.stop(true)
   }
@@ -136,7 +136,7 @@ test("defensively syncs advertised Copilot models", async () => {
 
     expect(model?.name).toBe("GPT-5 local")
     expect(model?.package).toBe(Provider.aisdk("@ai-sdk/github-copilot"))
-    expect(model?.settings).toMatchObject({ baseURL: server.url.origin, endpoint: "responses", transport: "websocket" })
+    expect(model?.settings).toMatchObject({ baseURL: server.url.origin, endpoint: "responses", websocket: true })
     expect(model?.cost[0]).toMatchObject({ input: 0, output: 0, cache: { read: 0, write: 0 } })
     expect(model?.variants.map((variant) => variant.id)).toEqual([
       Model.VariantID.make("low"),
