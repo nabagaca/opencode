@@ -1,3 +1,4 @@
+import { InvalidResponseDataError } from "@ai-sdk/provider"
 import { OpenAIResponsesLanguageModel } from "@opencode/core/github-copilot/responses/openai-responses-language-model"
 import { convertToOpenAIResponsesInput } from "@opencode/core/github-copilot/responses/convert-to-openai-responses-input"
 import { describe, test, expect, mock } from "bun:test"
@@ -199,9 +200,18 @@ function createMockFetch(body: unknown) {
 }
 
 function createStreamFetch(events: ReadonlyArray<Record<string, unknown>>) {
+  const frames = events.some((event) => event.type === "response.completed" || event.type === "response.incomplete")
+    ? events
+    : [
+        ...events,
+        {
+          type: "response.completed",
+          response: { incomplete_details: null, usage: { input_tokens: 1, output_tokens: 1 } },
+        },
+      ]
   return mock(
     async () =>
-      new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+      new Response(frames.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
         status: 200,
         headers: { "Content-Type": "text/event-stream" },
       }),
@@ -448,6 +458,117 @@ describe("doGenerate", () => {
 })
 
 describe("doStream", () => {
+  test.each([
+    [null, "stop"],
+    ["max_output_tokens", "length"],
+    ["content_filter", "content-filter"],
+    ["unrecognized-provider-value", "other"],
+  ] as const)("preserves completion diagnostics for %s", async (raw, unified) => {
+    const model = createModel(
+      createStreamFetch([
+        {
+          type: raw === null ? "response.completed" : "response.incomplete",
+          response: {
+            incomplete_details: raw === null ? null : { reason: raw },
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        },
+      ]),
+    )
+    const events = await readStream((await model.doStream({ prompt: TEST_PROMPT })).stream)
+    expect(events.find((event) => event.type === "finish")).toMatchObject({
+      finishReason: { unified, raw: raw ?? undefined },
+      providerMetadata: {
+        copilot: {
+          finishReason: {
+            adapter: unified,
+            raw,
+            eventType: raw === null ? "response.completed" : "response.incomplete",
+            responseFinished: true,
+            hasToolCalls: false,
+          },
+        },
+      },
+    })
+  })
+
+  test("does not infer completion from an item when the final SSE event is truncated", async () => {
+    const model = createModel(
+      mock(
+        async () =>
+          new Response(
+            'data: {"type":"response.output_text.delta","item_id":"msg_1","delta":"OK"}\n\n' +
+              'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1"}}\n\n' +
+              'data: {"type":"response.completed","response":{"status":"completed","tools":[{"description":"cut off',
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+      ),
+    )
+    const events = await readStream((await model.doStream({ prompt: TEST_PROMPT })).stream)
+    expect(events.some((event) => event.type === "finish")).toBe(false)
+    const failure = events.find((event) => event.type === "error")
+    expect(InvalidResponseDataError.isInstance(failure?.error)).toBe(true)
+    expect(failure?.error).toMatchObject({
+      message: expect.stringContaining("without response.completed or response.incomplete"),
+      data: {
+        finishReason: {
+          adapter: "other",
+          raw: null,
+          eventType: "response.output_item.done",
+          responseFinished: false,
+          hasToolCalls: false,
+        },
+      },
+    })
+  })
+
+  test("preserves tool continuation and completion diagnostics", async () => {
+    const model = createModel(
+      createStreamFetch([
+        {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "lookup", arguments: "" },
+        },
+        {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "lookup", arguments: "{}" },
+        },
+        {
+          type: "response.completed",
+          response: { incomplete_details: null, usage: { input_tokens: 1, output_tokens: 1 } },
+        },
+      ]),
+    )
+    const events = await readStream((await model.doStream({ prompt: TEST_PROMPT })).stream)
+    expect(events.find((event) => event.type === "finish")).toMatchObject({
+      finishReason: { unified: "tool-calls", raw: undefined },
+      providerMetadata: {
+        copilot: { finishReason: { adapter: "tool-calls", hasToolCalls: true, responseFinished: true } },
+      },
+    })
+  })
+
+  test("preserves transport failures instead of replacing them with a clean-EOF error", async () => {
+    const failure = new TypeError("terminated")
+    const model = createModel(
+      mock(
+        async () =>
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.error(failure)
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+      ),
+    )
+    const result = await model.doStream({ prompt: TEST_PROMPT })
+    await expect(readStream(result.stream)).rejects.toBe(failure)
+  })
+
   test.each([...HOSTED_TOOL_CASES])("uses $name for every streamed $id identity event", async (testCase) => {
     const model = createModel(createStreamFetch(testCase.stream))
     const result = await model.doStream({

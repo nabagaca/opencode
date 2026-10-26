@@ -1,4 +1,5 @@
 import { APICallError } from "@ai-sdk/provider"
+import { OpenAIResponsesLanguageModel } from "@opencode/core/github-copilot/responses/openai-responses-language-model"
 import type { LanguageModelV3, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import { AISDK } from "@opencode/core/aisdk"
@@ -71,6 +72,65 @@ const client = LLMClient.layer.pipe(
       }),
     ),
   ),
+)
+
+const finishCases = [
+  ["stop", "stop", "stop"],
+  ["tool-calls", "tool_calls", "tool-calls"],
+  ["length", "max_output_tokens", "length"],
+  ["content-filter", "content_filter", "content-filter"],
+  ["other", "provider_unmapped", "unknown"],
+  ["other", undefined, "unknown"],
+] as const
+
+finishCases.forEach(([unified, raw, normalized]) => {
+  it.effect(`preserves AI SDK finish ${unified} with raw ${raw}`, () =>
+    Effect.gen(function* () {
+      const aisdk = yield* AISDK.Service
+      yield* aisdk.hook.sdk((event) => {
+        event.sdk = { languageModel: () => streamModel([{ type: "finish", finishReason: { unified, raw }, usage }]) }
+      })
+      const resolved = yield* aisdk.model(model("test-ai-sdk"))
+      const response = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" })).pipe(
+        Effect.provide(client),
+      )
+      expect(response.finishReason).toEqual({ normalized, raw })
+    }),
+  )
+})
+
+it.effect("does not retry a cleanly closed but malformed Copilot response", () =>
+  Effect.gen(function* () {
+    const aisdk = yield* AISDK.Service
+    yield* aisdk.hook.sdk((event) => {
+      event.sdk = {
+        languageModel: () =>
+          new OpenAIResponsesLanguageModel("test", {
+            provider: "copilot",
+            headers: () => ({}),
+            url: () => "https://example.test/responses",
+            fetch: Object.assign(
+              async () =>
+                new Response(
+                  'data: {"type":"response.output_text.delta","item_id":"msg_1","delta":"OK"}\n\n' +
+                    'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1"}}\n\n' +
+                    'data: {"type":"response.completed","response":{"status":"completed","tools":[{"description":"cut off',
+                  { headers: { "content-type": "text/event-stream" } },
+                ),
+              { preconnect: fetch.preconnect },
+            ),
+          }),
+      }
+    })
+    const resolved = yield* aisdk.model(model("test-ai-sdk"))
+    const error = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" })).pipe(
+      Effect.provide(client),
+      Effect.flip,
+    )
+    expect(error.reason._tag).toBe("InvalidProviderOutput")
+    expect(error.message).toContain("without response.completed or response.incomplete")
+    expect(SessionRunnerRetry.isRetryable(error)).toBe(false)
+  }),
 )
 
 it.effect("rejects native provider compaction rather than silently dropping replay state", () =>

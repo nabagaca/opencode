@@ -5823,6 +5823,37 @@ describe("SessionRunnerLLM", () => {
     expect(yield* s.context).toMatchObject(context)
   })
 
+  scenario("does not retry malformed provider output after observable text", function* (s) {
+    const failure = new AIError({
+      reason: new InvalidProviderOutputError({
+        message: "Copilot Responses stream ended without response.completed or response.incomplete.",
+      }),
+    })
+    yield* s.admit("Do not repeat malformed responses")
+    yield* s.llm.push(
+      TestLLM.failAfter(
+        failure,
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "malformed-partial" }),
+        LLMEvent.textDelta({ id: "malformed-partial", text: "OK" }),
+        LLMEvent.textEnd({ id: "malformed-partial" }),
+      ),
+    )
+    expect(yield* s.resume.pipe(Effect.flip)).toBe(failure)
+    expect(s.requests).toHaveLength(1)
+    expect(yield* recordedEventTypes(sessionID)).not.toContain("session.retry.scheduled.1")
+    expect(yield* s.context).toMatchObject([
+      { type: "user" },
+      Expected.assistant(
+        {
+          finish: "error",
+          error: { type: "provider.invalid-output", message: failure.message },
+        },
+        [Expected.text("OK")],
+      ),
+    ])
+  })
+
   scenario("continues an unknown finish after observable text", function* (s) {
     yield* s.admit("Continue unknown finish")
     yield* s.llm.push([
@@ -5830,8 +5861,8 @@ describe("SessionRunnerLLM", () => {
       LLMEvent.textStart({ id: "unknown-partial" }),
       LLMEvent.textDelta({ id: "unknown-partial", text: "Partial" }),
       LLMEvent.textEnd({ id: "unknown-partial" }),
-      LLMEvent.stepFinish({ index: 0, reason: { normalized: "unknown" } }),
-      LLMEvent.finish({ reason: { normalized: "unknown" } }),
+      LLMEvent.stepFinish({ index: 0, reason: { normalized: "unknown", raw: "provider_unmapped" } }),
+      LLMEvent.finish({ reason: { normalized: "unknown", raw: "provider_unmapped" } }),
     ])
     yield* s.llm.push(TestLLM.text(" continuation", "unknown-continuation"))
 
@@ -5848,7 +5879,14 @@ describe("SessionRunnerLLM", () => {
     })
     expect(yield* s.context).toMatchObject([
       { type: "user" },
-      Expected.assistant({ finish: "error" }, [Expected.text("Partial")]),
+      Expected.assistant(
+        {
+          finish: "error",
+          rawFinish: "provider_unmapped",
+          error: { message: expect.stringContaining('raw: "provider_unmapped"') },
+        },
+        [Expected.text("Partial")],
+      ),
       { type: "synthetic", text: INCOMPLETE_STREAM_CONTINUATION },
       Expected.assistant({ finish: "stop" }, [Expected.text(" continuation")]),
     ])

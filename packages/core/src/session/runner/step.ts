@@ -172,7 +172,7 @@ export const make = Effect.gen(function* () {
           Exit.isSuccess(stream) && recorded.finish?.finish === "unknown"
             ? new AIError({
                 reason: new InvalidProviderOutputError({
-                  message: "The provider response ended with an unknown finish reason.",
+                  message: `The provider response ended with an unknown finish reason (raw: ${JSON.stringify(recorded.finish.rawFinish ?? null)}).`,
                   classification: "incomplete-stream",
                 }),
               })
@@ -197,6 +197,17 @@ export const make = Effect.gen(function* () {
                 ),
               )
             : undefined
+        if (unknownFinish)
+          yield* Effect.logWarning("Unknown provider finish decision", {
+            sessionID: input.sessionID,
+            model: input.model.ref,
+            finish: recorded.finish?.finish,
+            rawFinish: recorded.finish?.rawFinish ?? null,
+            copilot: recorded.finish?.native?.finishReason,
+            hasClientToolCalls: toolRuns.length > 0,
+            decision: retry?.retry ? (recorded.outputStarted ? "continue" : "retry") : "fail",
+            attempt: retry?.retry ? retry.attempt : undefined,
+          })
         if (llmFailure && llmError && retry?.retry && !recorded.outputStarted) {
           // Retry state projects onto the existing assistant, even before it has produced output.
           yield* publisher.startAssistant()

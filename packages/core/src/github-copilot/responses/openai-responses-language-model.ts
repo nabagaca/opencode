@@ -1,5 +1,6 @@
 import {
   APICallError,
+  InvalidResponseDataError,
   type JSONValue,
   type LanguageModelV3,
   type LanguageModelV3CallOptions,
@@ -746,6 +747,9 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
 
     // Track current active reasoning output_index for correlating summary events
     let currentReasoningOutputIndex: number | null = null
+    // Item completion is not response completion; EOF can interrupt the final SSE event.
+    let lastEventType: string | undefined
+    let responseFinished = false
 
     // Track a stable text part id for the current assistant message.
     // Copilot may change item_id across text deltas; normalize to one id.
@@ -776,6 +780,7 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
             }
 
             const value = chunk.value
+            lastEventType = value.type
 
             if (isResponseOutputItemAddedChunk(value)) {
               if (value.item.type === "function_call") {
@@ -1166,6 +1171,7 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
                 })
               }
             } else if (isResponseFinishedChunk(value)) {
+              responseFinished = true
               finishReason = {
                 unified: mapOpenAIResponseFinishReason({
                   finishReason: value.response.incomplete_details?.reason,
@@ -1225,6 +1231,13 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
             const providerMetadata: SharedV3ProviderMetadata = {
               copilot: {
                 responseId,
+                finishReason: {
+                  adapter: finishReason.unified,
+                  raw: finishReason.raw ?? null,
+                  eventType: lastEventType ?? null,
+                  responseFinished,
+                  hasToolCalls: hasFunctionCall,
+                },
               },
             }
 
@@ -1234,6 +1247,21 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
 
             if (serviceTier !== undefined) {
               providerMetadata.copilot.serviceTier = serviceTier
+            }
+
+            // Clean EOF without response completion is malformed output, not a successful unknown finish.
+            if (!responseFinished && finishReason.unified !== "error") {
+              controller.enqueue({
+                type: "error",
+                error: new InvalidResponseDataError({
+                  message:
+                    "Copilot Responses stream ended without response.completed or response.incomplete " +
+                    `(last event: ${lastEventType ?? "none"}; adapter finish: ${finishReason.unified}; ` +
+                    `raw: ${JSON.stringify(finishReason.raw ?? null)}; client tool calls: ${hasFunctionCall}).`,
+                  data: providerMetadata.copilot,
+                }),
+              })
+              return
             }
 
             controller.enqueue({

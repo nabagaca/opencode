@@ -1,7 +1,7 @@
 export * as AISDK from "./aisdk.js"
 
 import { makeLocationNode } from "@opencode/util/effect/app-node"
-import { APICallError } from "@ai-sdk/provider"
+import { APICallError, InvalidResponseDataError } from "@ai-sdk/provider"
 import type {
   JSONSchema7,
   JSONValue,
@@ -721,7 +721,7 @@ function metadataProviderOptions(input: ProviderMetadata | undefined): SharedV3P
 }
 
 function streamLanguage(language: LanguageModelV3, options: LanguageModelV3CallOptions, http?: HttpMiddleware) {
-  const state: StreamState = { step: 0, toolNames: {}, open: {} }
+  const state: StreamState = { step: 0, toolNames: {}, hasToolCalls: false, open: {} }
   return Stream.concat(
     Stream.make(LLMEvent.stepStart({ index: state.step })),
     Stream.unwrap(
@@ -752,6 +752,7 @@ type Fragment = "text" | "reasoning"
 type StreamState = {
   step: number
   toolNames: Record<string, string>
+  hasToolCalls: boolean
   open: Partial<Record<Fragment, string>>
 }
 
@@ -816,6 +817,7 @@ function streamPartEvents(
         }),
       ])
     case "tool-call":
+      state.hasToolCalls = true
       state.toolNames[event.toolCallId] = event.toolName
       return ProviderShared.parseToolInput("aisdk", event.toolName, event.input).pipe(
         Effect.map((input) => [
@@ -851,19 +853,30 @@ function streamPartEvents(
         }),
       ])
     case "finish":
-      return Effect.succeed([
-        LLMEvent.stepFinish({
-          index: state.step++,
-          reason: { normalized: finishReason(event.finishReason), raw: event.finishReason.raw },
-          usage: usage(event.usage),
-          providerMetadata: providerMetadata(event.providerMetadata),
-        }),
-        LLMEvent.finish({
-          reason: { normalized: finishReason(event.finishReason), raw: event.finishReason.raw },
-          usage: usage(event.usage),
-          providerMetadata: providerMetadata(event.providerMetadata),
-        }),
-      ])
+      return Effect.gen(function* () {
+        if (event.finishReason.unified === "other")
+          yield* Effect.logWarning("Unmapped AI SDK finish reason", {
+            rawFinish: event.finishReason.raw ?? null,
+            sdkFinish: event.finishReason.unified,
+            finish: finishReason(event.finishReason),
+            eventType: event.type,
+            hasToolCalls: state.hasToolCalls,
+            copilot: event.providerMetadata?.copilot?.finishReason,
+          })
+        return [
+          LLMEvent.stepFinish({
+            index: state.step++,
+            reason: { normalized: finishReason(event.finishReason), raw: event.finishReason.raw },
+            usage: usage(event.usage),
+            providerMetadata: providerMetadata(event.providerMetadata),
+          }),
+          LLMEvent.finish({
+            reason: { normalized: finishReason(event.finishReason), raw: event.finishReason.raw },
+            usage: usage(event.usage),
+            providerMetadata: providerMetadata(event.providerMetadata),
+          }),
+        ]
+      })
     case "error":
       return Effect.fail(llmError(event.error, "read"))
   }
@@ -931,6 +944,8 @@ function jsonValue(input: unknown): JSONValue {
 
 function llmError(error: unknown, operation: "request" | "read") {
   if (error instanceof AIError) return error
+  if (InvalidResponseDataError.isInstance(error))
+    return ProviderShared.eventError("ai-sdk", error.message, undefined, error)
   if (APICallError.isInstance(error)) return apiCallError(error)
   const network = networkFailure(error)
   if (network)
