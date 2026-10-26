@@ -1,5 +1,6 @@
 import { APICallError } from "@ai-sdk/provider"
 import { OpenAIResponsesLanguageModel } from "@opencode/core/github-copilot/responses/openai-responses-language-model"
+import { createOpenaiCompatible } from "@opencode/core/github-copilot/copilot-provider"
 import type { LanguageModelV3, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import { AISDK } from "@opencode/core/aisdk"
@@ -71,6 +72,120 @@ const client = LLMClient.layer.pipe(
         execute: () => Effect.die("Unexpected HTTP request"),
       }),
     ),
+  ),
+)
+
+const copilotFinishes = [
+  { normalized: "stop", reason: null },
+  { normalized: "tool-calls", reason: null },
+  { normalized: "length", reason: "max_output_tokens" },
+  { normalized: "content-filter", reason: "content_filter" },
+  { normalized: "unknown", reason: "provider_unmapped" },
+] as const
+
+copilotFinishes.forEach(({ normalized, reason }) =>
+  it.live(`uses Copilot WebSocket Responses and preserves ${normalized}`, () =>
+    Effect.gen(function* () {
+      const requests: unknown[] = []
+      const seen: string[] = []
+      const server = Bun.serve({
+        port: 0,
+        fetch(request, server) {
+          seen.push(request.headers.get("x-hook") ?? "missing")
+          if (request.headers.has("content-length"))
+            return new Response("Unexpected HTTP body framing", { status: 400 })
+          if (server.upgrade(request)) return
+          return new Response(
+            'data: {"type":"response.output_text.delta","item_id":"msg_1","delta":"OK"}\n\n' +
+              'data: {"type":"response.completed","response":{"tools":[{"description":"cut off',
+            { headers: { "content-type": "text/event-stream" } },
+          )
+        },
+        websocket: {
+          message(socket, message) {
+            requests.push(JSON.parse(String(message)))
+            socket.send(
+              JSON.stringify({
+                type: "response.created",
+                response: { id: "resp_1", created_at: 1, model: "api-model" },
+              }),
+            )
+            socket.send(JSON.stringify({ type: "response.output_text.delta", item_id: "msg_1", delta: "OK" }))
+            if (normalized === "tool-calls") {
+              socket.send(
+                JSON.stringify({
+                  type: "response.output_item.added",
+                  output_index: 1,
+                  item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "synthetic_probe" },
+                }),
+              )
+              socket.send(
+                JSON.stringify({
+                  type: "response.function_call_arguments.delta",
+                  item_id: "fc_1",
+                  output_index: 1,
+                  delta: "{}",
+                }),
+              )
+              socket.send(
+                JSON.stringify({
+                  type: "response.output_item.done",
+                  output_index: 1,
+                  item: {
+                    type: "function_call",
+                    id: "fc_1",
+                    call_id: "call_1",
+                    name: "synthetic_probe",
+                    arguments: "{}",
+                  },
+                }),
+              )
+            }
+            socket.send(
+              JSON.stringify({
+                type: reason ? "response.incomplete" : "response.completed",
+                response: {
+                  status: reason ? "incomplete" : "completed",
+                  incomplete_details: reason ? { reason } : null,
+                  usage: { input_tokens: 1, output_tokens: 1 },
+                },
+              }),
+            )
+          },
+        },
+      })
+      yield* Effect.addFinalizer(() => Effect.promise(() => server.stop(true)))
+      const aisdk = yield* AISDK.Service
+      yield* aisdk.hook.sdk((event) => {
+        event.sdk = createOpenaiCompatible(event.options)
+      })
+      yield* aisdk.hook.language((event) => {
+        event.language = event.sdk.responses("api-model")
+      })
+      const resolved = yield* aisdk.model({
+        ...model("@ai-sdk/github-copilot", {
+          baseURL: server.url.origin,
+          apiKey: "test",
+          transport: "websocket",
+        }),
+        providerID: Provider.ID.githubCopilot,
+      })
+      const response = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" }), {
+        http: (request, handler) => handler(HttpClientRequest.setHeader(request, "x-hook", "applied")),
+      }).pipe(Effect.provide(client))
+      expect(seen).toEqual(["applied"])
+      expect(requests).toEqual([
+        expect.objectContaining({
+          type: "response.create",
+          model: "api-model",
+          initiator: "user",
+        }),
+      ])
+      expect(requests[0]).not.toHaveProperty("stream")
+      expect(response.finishReason.normalized).toBe(normalized)
+      expect(response.finishReason.raw).toBe(reason ?? undefined)
+      expect(response.events.filter(LLMEvent.is.textDelta).map((event) => event.text)).toEqual(["OK"])
+    }),
   ),
 )
 
@@ -623,11 +738,19 @@ it.effect("normalizes file data across AI SDK prompt parts", () =>
           Message.user([
             { type: "media", media: Media.bytes(bytes, "image/png"), filename: "bytes.png" },
             { type: "media", media: Media.base64("AAAA", "image/png"), filename: "base64.png" },
-            { type: "media", media: Media.fromDataUrl("data:image/png;charset=utf-8;base64,AQID"), filename: "inline.png" },
+            {
+              type: "media",
+              media: Media.fromDataUrl("data:image/png;charset=utf-8;base64,AQID"),
+              filename: "inline.png",
+            },
             { type: "media", media: Media.url("https://example.com/image.png", { mediaType: "image/png" }) },
             { type: "media", media: Media.base64("s3://bucket/image.png", "image/png") },
           ]),
-          Message.assistant({ type: "media", media: Media.url("http://example.com/document.pdf", { mediaType: "application/pdf" }), filename: "document.pdf" }),
+          Message.assistant({
+            type: "media",
+            media: Media.url("http://example.com/document.pdf", { mediaType: "application/pdf" }),
+            filename: "document.pdf",
+          }),
           Message.tool({
             id: "call_1",
             name: "screenshot",
@@ -810,12 +933,7 @@ it.effect("routes AI SDK requests and responses through HTTP hook middleware", (
     expect(sent[0]?.headers.get("x-hook")).toBe("applied")
     expect(sent[0]?.headers.get("authorization")).toBe("Bearer test")
     expect(JSON.parse(sent[0]?.body ?? "")).toMatchObject({ model: "api-model" })
-    expect(seen).toEqual([
-      "POST https://example.test/v1/chat/completions",
-      sent[0]?.body,
-      sent[0]?.body,
-      "status 200",
-    ])
+    expect(seen).toEqual(["POST https://example.test/v1/chat/completions", sent[0]?.body, sent[0]?.body, "status 200"])
     expect(response.events.filter(LLMEvent.is.textDelta).map((event) => event.text)).toEqual(["rewritten"])
   }),
 )

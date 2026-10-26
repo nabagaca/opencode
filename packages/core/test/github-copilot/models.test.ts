@@ -3,6 +3,44 @@ import { CopilotModels } from "@opencode/core/github-copilot/models"
 import { Model } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
 
+test.each([
+  { endpoints: ["/responses", "ws:/responses"], override: undefined, expected: "websocket" },
+  { endpoints: ["/responses", "ws:/responses"], override: "http", expected: "http" },
+  { endpoints: ["/responses"], override: undefined, expected: undefined },
+  { endpoints: ["/v1/messages", "/responses", "ws:/responses"], override: undefined, expected: undefined },
+])("selects advertised Responses transport ($endpoints, $override)", async ({ endpoints, override, expected }) => {
+  const server = Bun.serve({
+    port: 0,
+    fetch: () =>
+      Response.json({
+        data: [
+          {
+            id: "model",
+            name: "Model",
+            version: "2026-10-26",
+            model_picker_enabled: true,
+            supported_endpoints: endpoints,
+            capabilities: {
+              family: "gpt",
+              limits: { max_output_tokens: 1000, max_prompt_tokens: 8000 },
+              supports: { tool_calls: true },
+            },
+          },
+        ],
+      }),
+  })
+  try {
+    const previous = Model.Info.make({
+      ...Model.Info.default(Provider.ID.githubCopilot, Model.ID.make("model")),
+      settings: override ? { transport: override } : {},
+    })
+    const models = await CopilotModels.get(server.url.origin, {}, [previous])
+    expect(models.get(Model.ID.make("model"))?.settings?.transport).toBe(expected)
+  } finally {
+    await server.stop(true)
+  }
+})
+
 test("defensively syncs advertised Copilot models", async () => {
   const server = Bun.serve({
     port: 0,
@@ -14,7 +52,7 @@ test("defensively syncs advertised Copilot models", async () => {
             id: "gpt-5",
             name: "GPT-5 remote",
             version: "gpt-5-2026-06-01",
-            supported_endpoints: ["/responses"],
+            supported_endpoints: ["/responses", "ws:/responses"],
             billing: {
               token_prices: {
                 batch_size: 0,
@@ -98,7 +136,7 @@ test("defensively syncs advertised Copilot models", async () => {
 
     expect(model?.name).toBe("GPT-5 local")
     expect(model?.package).toBe(Provider.aisdk("@ai-sdk/github-copilot"))
-    expect(model?.settings).toMatchObject({ baseURL: server.url.origin, endpoint: "responses" })
+    expect(model?.settings).toMatchObject({ baseURL: server.url.origin, endpoint: "responses", transport: "websocket" })
     expect(model?.cost[0]).toMatchObject({ input: 0, output: 0, cache: { read: 0, write: 0 } })
     expect(model?.variants.map((variant) => variant.id)).toEqual([
       Model.VariantID.make("low"),
@@ -148,8 +186,16 @@ test("prices cache reads from either token price spelling", async () => {
 
   try {
     const models = await CopilotModels.get(server.url.origin, {}, [])
-    expect(models.get(Model.ID.make("renamed"))?.cost[0]).toMatchObject({ input: 2.5, output: 15, cache: { read: 0.25 } })
-    expect(models.get(Model.ID.make("legacy"))?.cost[0]).toMatchObject({ input: 2.5, output: 15, cache: { read: 0.25 } })
+    expect(models.get(Model.ID.make("renamed"))?.cost[0]).toMatchObject({
+      input: 2.5,
+      output: 15,
+      cache: { read: 0.25 },
+    })
+    expect(models.get(Model.ID.make("legacy"))?.cost[0]).toMatchObject({
+      input: 2.5,
+      output: 15,
+      cache: { read: 0.25 },
+    })
     expect(models.get(Model.ID.make("unpriced"))?.cost[0]).toMatchObject({ cache: { read: 0 } })
   } finally {
     await server.stop(true)

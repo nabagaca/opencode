@@ -41,6 +41,7 @@ import type { ID, RuntimeInfo } from "./model.js"
 import { Provider } from "./provider.js"
 import { State } from "./state.js"
 import { stringify } from "./tool/runtime.js"
+import { CopilotWebSocket } from "./github-copilot/websocket.js"
 
 type SDK = any
 type UserContent = Extract<LanguageModelV3Message, { role: "user" }>["content"]
@@ -130,6 +131,7 @@ function prepareOptions(model: RuntimeInfo, pkg: string) {
   }
 
   const customFetch = options.fetch
+  const transport = options.transport
   const timeouts = Provider.timeouts(options)
   delete options.headerTimeout
   delete options.chunkTimeout
@@ -161,7 +163,11 @@ function prepareOptions(model: RuntimeInfo, pkg: string) {
       }
     }
 
-    const send: Fetch = isFetch(customFetch) ? customFetch : fetch
+    const send: Fetch = isFetch(customFetch)
+      ? customFetch
+      : pkg === "@ai-sdk/github-copilot" && transport === "websocket"
+        ? CopilotWebSocket.request
+        : fetch
     const middleware = httpMiddleware.getStore()
     const res = await (
       middleware
