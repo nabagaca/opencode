@@ -130,3 +130,53 @@ test("keeps non-streaming generation on HTTP", async () => {
     await fixture.instance.stop(true)
   }
 })
+
+const body = JSON.stringify({ model: "gpt-6.1-sol", stream: true })
+const quick = CopilotWebSocket.make({ pingInterval: 20, staleAfter: 150 })
+
+test("keeps a silent stream alive while the peer answers pings", async () => {
+  const instance = Bun.serve({
+    port: 0,
+    fetch(request, server) {
+      if (server.upgrade(request)) return
+      return new Response(null, { status: 400 })
+    },
+    websocket: {
+      message(socket) {
+        setTimeout(() => socket.send('{"type":"response.completed"}'), 400)
+      },
+    },
+  })
+  try {
+    const response = await quick(`${instance.url}responses`, { method: "POST", body })
+    expect(await response.text()).toBe('data: {"type":"response.completed"}\n\n')
+  } finally {
+    await instance.stop(true)
+  }
+})
+
+test("fails a stream whose peer stops responding", async () => {
+  // A raw socket completes the upgrade, then never answers frames or pings, like a connection dropped by a proxy.
+  const listener = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      data(socket, data) {
+        const key = /sec-websocket-key: (.+)\r\n/i.exec(data.toString())?.[1]
+        if (!key) return
+        const accept = new Bun.CryptoHasher("sha1")
+          .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+          .digest("base64")
+        socket.write(
+          `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+        )
+      },
+    },
+  })
+  try {
+    const response = await quick(`http://127.0.0.1:${listener.port}/responses`, { method: "POST", body })
+    await expect(response.text()).rejects.toMatchObject({ code: "ETIMEDOUT" })
+  } finally {
+    listener.stop(true)
+  }
+})
