@@ -566,7 +566,7 @@ describe("doStream", () => {
       ),
     )
     const result = await model.doStream({ prompt: TEST_PROMPT })
-    await expect(readStream(result.stream)).rejects.toBe(failure)
+    await expect(readStream(result.stream)).rejects.toMatchObject({ cause: failure })
   })
 
   test.each([...HOSTED_TOOL_CASES])("uses $name for every streamed $id identity event", async (testCase) => {
