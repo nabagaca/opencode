@@ -1,182 +1,155 @@
 import { expect, test } from "bun:test"
+import { ai, LanguageModel, Message } from "@opencode/ai/effect"
+import { LLMClient, RequestExecutor, WebSocketTransport } from "@opencode/ai/route"
 import { CopilotWebSocket } from "@opencode/core/github-copilot/websocket"
-import { InvalidResponseDataError } from "@ai-sdk/provider"
-import { AIError } from "@opencode/ai/effect"
+import { ModelResolver } from "@opencode/core/model-resolver"
+import { Model } from "@opencode/core/model"
+import { Provider } from "@opencode/core/provider"
+import { WebSocketConstructor } from "@opencode/core/effect/websocket-constructor"
+import { Effect, Fiber, Layer, Stream } from "effect"
+import { Headers } from "effect/http"
+import { TestClock } from "effect/testing"
+import { Socket } from "effect/socket"
+import { testEffect } from "../lib/effect"
 
-function server(messages: string[], close = false) {
-  const closed = Promise.withResolvers<void>()
-  const requests: unknown[] = []
-  const headers: Headers[] = []
-  const instance = Bun.serve({
-    port: 0,
-    fetch(request, server) {
-      headers.push(request.headers)
-      if (server.upgrade(request)) return
-      return Response.json({ ordinary: true })
-    },
-    websocket: {
-      message(socket, message) {
-        requests.push(JSON.parse(String(message)))
-        messages.forEach((message) => socket.send(message))
-        if (close) socket.close()
-      },
-      close() {
-        closed.resolve()
-      },
-    },
+const it = testEffect(WebSocketConstructor.layer)
+
+test.each(["user", "agent"])("declares the %s initiator in native frames", (initiator) => {
+  const input =
+    initiator === "user" ? [{ role: "user", content: [] }] : [{ type: "function_call_output", output: "OK" }]
+  expect(JSON.parse(CopilotWebSocket.initiate(JSON.stringify({ type: "response.create", input })))).toMatchObject({
+    initiator,
   })
-  return {
-    instance,
-    closed: closed.promise,
-    requests,
-    headers,
-    request: (signal?: AbortSignal) =>
-      CopilotWebSocket.request(`${instance.url}responses`, {
-        method: "POST",
-        headers: { authorization: "Bearer fixture", "content-type": "application/json", "x-initiator": "agent" },
-        body: JSON.stringify({ model: "gpt-6.1-sol", stream: true, store: false, tools: [] }),
-        signal,
-      }),
-  }
-}
-
-test("streams complete provider events and closes the connection", async () => {
-  const fixture = server([
-    '{"type":"response.output_text.delta","delta":"OK"}',
-    '{"type":"response.completed","response":{"status":"completed"}}',
-  ])
-  try {
-    const response = await fixture.request()
-    expect(await response.text()).toBe(
-      'data: {"type":"response.output_text.delta","delta":"OK"}\n\n' +
-        'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
-    )
-    expect(fixture.requests).toEqual([
-      {
-        type: "response.create",
-        model: "gpt-6.1-sol",
-        store: false,
-        tools: [],
-        initiator: "agent",
-      },
-    ])
-    expect(fixture.headers[0]?.get("authorization")).toBe("Bearer fixture")
-    await fixture.closed
-  } finally {
-    await fixture.instance.stop(true)
-  }
 })
 
-test.each(["response.incomplete", "response.failed", "error"])(
-  "ends on %s without fabricating completion",
-  async (type) => {
-    const fixture = server([JSON.stringify({ type })])
-    try {
-      expect(await (await fixture.request()).text()).toBe(`data: ${JSON.stringify({ type })}\n\n`)
-      await fixture.closed
-    } finally {
-      await fixture.instance.stop(true)
-    }
-  },
+it.live("streams Copilot Responses through the native parser without an HTTP request", () =>
+  Effect.gen(function* () {
+    const requests: unknown[] = []
+    const vision: Array<string | null> = []
+    const server = Bun.serve({
+      port: 0,
+      fetch(request, server) {
+        vision.push(request.headers.get("copilot-vision-request"))
+        if (server.upgrade(request)) return
+        return new Response("Unexpected HTTP request", { status: 500 })
+      },
+      websocket: {
+        message(socket, message) {
+          requests.push(JSON.parse(String(message)))
+          socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_1" } }))
+          socket.send(JSON.stringify({ type: "response.output_text.delta", item_id: "msg_1", delta: "OK" }))
+          socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_1", output: [] } }))
+        },
+      },
+    })
+    yield* Effect.addFinalizer(() => Effect.promise(() => server.stop(true)))
+    const model = yield* ModelResolver.fromCatalogModel({
+      ...Model.Info.default(Provider.ID.githubCopilot, Model.ID.make("gpt-6.1-sol")),
+      package: "@opencode/ai/providers/openai-compatible-responses",
+      settings: { baseURL: server.url.origin, apiKey: "fixture" },
+    })
+    expect(model).toBeInstanceOf(LanguageModel)
+    const constructor = yield* Socket.WebSocketConstructor
+    const response = yield* LLMClient.generate(
+      ai.request({
+        model,
+        messages: [Message.user([Message.text("Hello"), Message.media("data:image/png;base64,AAAA")])],
+      }),
+      {
+        webSocket: WebSocketTransport.makeDirect({
+          open: (input) =>
+            CopilotWebSocket.open(input).pipe(Effect.provideService(Socket.WebSocketConstructor, constructor)),
+        }),
+      },
+    ).pipe(
+      Effect.provide(
+        LLMClient.layer.pipe(
+          Layer.provide(
+            Layer.succeed(
+              RequestExecutor.Service,
+              RequestExecutor.Service.of({ execute: () => Effect.die("Unexpected HTTP fallback") }),
+            ),
+          ),
+        ),
+      ),
+    )
+    expect(response.finishReason.normalized).toBe("stop")
+    expect(vision).toEqual(["true"])
+    expect(requests).toEqual([expect.objectContaining({ type: "response.create", model: "gpt-6.1-sol" })])
+    expect(requests[0]).not.toHaveProperty("stream")
+  }),
 )
 
-test("reports early socket closure as a transport error", async () => {
-  const fixture = server([], true)
-  try {
-    await expect(fixture.request().then((response) => response.text())).rejects.toBeInstanceOf(AIError)
-    await fixture.closed
-  } finally {
-    await fixture.instance.stop(true)
-  }
-})
-
-test("reports malformed JSON as invalid provider output", async () => {
-  const fixture = server(['{"type":"response.completed"'])
-  try {
-    await expect(fixture.request().then((response) => response.text())).rejects.toBeInstanceOf(InvalidResponseDataError)
-    await fixture.closed
-  } finally {
-    await fixture.instance.stop(true)
-  }
-})
-
-test.each(["abort", "cancel"])("%s closes the active socket", async (mode) => {
-  const fixture = server([])
-  const controller = new AbortController()
-  try {
-    const response = await fixture.request(controller.signal)
-    if (mode === "abort") {
-      const text = response.text()
-      controller.abort()
-      await expect(text).rejects.toMatchObject({ name: "AbortError" })
-    }
-    if (mode === "cancel") await response.body?.cancel()
-    await fixture.closed
-  } finally {
-    await fixture.instance.stop(true)
-  }
-})
-
-test("keeps non-streaming generation on HTTP", async () => {
-  const fixture = server([])
-  try {
-    const response = await CopilotWebSocket.request(`${fixture.instance.url}responses`, {
-      method: "POST",
-      body: JSON.stringify({ model: "gpt-6.1-sol", stream: false }),
+it.effect("fails a socket blackholed by a proxy using the caller's clock", () =>
+  Effect.gen(function* () {
+    const listener = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data(socket, data) {
+          const key = /sec-websocket-key: (.+)\r\n/i.exec(data.toString())?.[1]
+          if (!key) return
+          const accept = new Bun.CryptoHasher("sha1")
+            .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+            .digest("base64")
+          socket.write(
+            `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+          )
+        },
+      },
     })
-    expect(await response.json()).toEqual({ ordinary: true })
-    expect(fixture.requests).toEqual([])
-  } finally {
-    await fixture.instance.stop(true)
-  }
-})
+    yield* Effect.addFinalizer(() => Effect.sync(() => listener.stop(true)))
+    const connection = yield* CopilotWebSocket.open({
+      url: `ws://127.0.0.1:${listener.port}/responses`,
+      headers: Headers.empty,
+    })
+    yield* Effect.addFinalizer(() => connection.close)
+    const reading = yield* Stream.runDrain(connection.messages).pipe(
+      Effect.flip,
+      Effect.forkChild({ startImmediately: true }),
+    )
+    yield* TestClock.adjust("60 seconds")
+    const error = yield* Fiber.join(reading)
+    expect(error.reason).toMatchObject({ _tag: "Transport", code: "ETIMEDOUT" })
+  }),
+)
 
-const body = JSON.stringify({ model: "gpt-6.1-sol", stream: true })
-const quick = CopilotWebSocket.make({ pingInterval: 20, staleAfter: 150 })
-
-test("keeps a silent stream alive while the peer answers pings", async () => {
-  const instance = Bun.serve({
-    port: 0,
-    fetch(request, server) {
-      if (server.upgrade(request)) return
-      return new Response(null, { status: 400 })
-    },
-    websocket: {
-      message(socket) {
-        setTimeout(() => socket.send('{"type":"response.completed"}'), 400)
+it.effect("keeps a silent but pong-responsive socket alive beyond the stale limit", () =>
+  Effect.gen(function* () {
+    const server = Bun.serve({
+      port: 0,
+      fetch(request, server) {
+        if (server.upgrade(request)) return
+        return new Response(null, { status: 400 })
       },
-    },
-  })
-  try {
-    const response = await quick(`${instance.url}responses`, { method: "POST", body })
-    expect(await response.text()).toBe('data: {"type":"response.completed"}\n\n')
-  } finally {
-    await instance.stop(true)
-  }
-})
-
-test("fails a stream whose peer stops responding", async () => {
-  // A raw socket completes the upgrade, then never answers frames or pings, like a connection dropped by a proxy.
-  const listener = Bun.listen({
-    hostname: "127.0.0.1",
-    port: 0,
-    socket: {
-      data(socket, data) {
-        const key = /sec-websocket-key: (.+)\r\n/i.exec(data.toString())?.[1]
-        if (!key) return
-        const accept = new Bun.CryptoHasher("sha1")
-          .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
-          .digest("base64")
-        socket.write(
-          `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
-        )
+      websocket: {
+        message(socket) {
+          socket.send("done")
+        },
       },
-    },
-  })
-  try {
-    const response = await quick(`http://127.0.0.1:${listener.port}/responses`, { method: "POST", body })
-    await expect(response.text()).rejects.toMatchObject({ code: "ETIMEDOUT" })
-  } finally {
-    listener.stop(true)
-  }
-})
+    })
+    yield* Effect.addFinalizer(() => Effect.promise(() => server.stop(true)))
+    const pong = { next: Promise.withResolvers<void>() }
+    const connection = yield* CopilotWebSocket.open({
+      url: `${server.url}responses`.replace(/^http/, "ws"),
+      headers: Headers.empty,
+    }).pipe(
+      Effect.provideService(Socket.WebSocketConstructor, (url) => {
+        const socket = new WebSocket(url)
+        socket.addEventListener("pong", () => pong.next.resolve())
+        return socket
+      }),
+    )
+    yield* Effect.addFinalizer(() => connection.close)
+    const reading = yield* Stream.runCollect(connection.messages.pipe(Stream.take(1))).pipe(
+      Effect.forkChild({ startImmediately: true }),
+    )
+    for (const _ of [1, 2, 3, 4, 5]) {
+      yield* TestClock.adjust("15 seconds")
+      yield* Effect.promise(() => pong.next.promise)
+      pong.next = Promise.withResolvers<void>()
+    }
+    yield* connection.sendText("finish")
+    expect(Array.from(yield* Fiber.join(reading))).toEqual(["done"])
+  }),
+)

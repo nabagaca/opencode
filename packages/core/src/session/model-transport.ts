@@ -18,6 +18,7 @@ import { Socket } from "effect/socket"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { SessionSchema } from "./schema.js"
 import { webSocketConstructor } from "../effect/app-node-platform.js"
+import { CopilotWebSocket } from "../github-copilot/websocket.js"
 
 const ROTATE_AFTER_MS = 55 * 60 * 1000
 const CONNECT_TIMEOUT = "15 seconds"
@@ -563,7 +564,10 @@ export const layer = Layer.unwrap(
   Effect.map(Socket.WebSocketConstructor, (constructor) =>
     makeLayer({
       open: (input) =>
-        WebSocketTransport.open(input).pipe(Effect.provideService(Socket.WebSocketConstructor, constructor)),
+        (input.headers["openai-intent"] === "conversation-edits"
+          ? CopilotWebSocket.open(input)
+          : WebSocketTransport.open(input)
+        ).pipe(Effect.provideService(Socket.WebSocketConstructor, constructor)),
     }),
   ),
 )

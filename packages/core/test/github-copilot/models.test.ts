@@ -1,44 +1,46 @@
 import { expect, test } from "bun:test"
 import { CopilotModels } from "@opencode/core/github-copilot/models"
+import { Effect } from "effect"
+import { FetchHttpClient, HttpClient } from "effect/http"
 import { Model } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
+
+const run = <A, E>(effect: (http: HttpClient.HttpClient) => Effect.Effect<A, E>) =>
+  Effect.runPromise(HttpClient.HttpClient.pipe(Effect.flatMap(effect), Effect.provide(FetchHttpClient.layer)))
 
 test.each([
   { endpoints: ["/responses", "ws:/responses"], override: undefined, expected: true },
   { endpoints: ["/responses", "ws:/responses"], override: false, expected: false },
   { endpoints: ["/responses"], override: undefined, expected: undefined },
   { endpoints: ["/v1/messages", "/responses", "ws:/responses"], override: undefined, expected: undefined },
-])("selects advertised Responses transport ($endpoints, $override)", async ({ endpoints, override, expected }) => {
-  const server = Bun.serve({
-    port: 0,
-    fetch: () =>
-      Response.json({
-        data: [
-          {
-            id: "model",
-            name: "Model",
-            version: "2026-10-26",
-            model_picker_enabled: true,
-            supported_endpoints: endpoints,
-            capabilities: {
-              family: "gpt",
-              limits: { max_output_tokens: 1000, max_prompt_tokens: 8000 },
-              supports: { tool_calls: true },
-            },
-          },
-        ],
-      }),
+])("selects advertised Responses transport ($endpoints, $override)", ({ endpoints, override, expected }) => {
+  const previous = Model.Info.make({
+    ...Model.Info.default(Provider.ID.githubCopilot, Model.ID.make("model")),
+    settings: override === undefined ? {} : { websocket: override },
   })
-  try {
-    const previous = Model.Info.make({
-      ...Model.Info.default(Provider.ID.githubCopilot, Model.ID.make("model")),
-      settings: override === undefined ? {} : { websocket: override },
-    })
-    const models = await CopilotModels.get(server.url.origin, {}, [previous])
-    expect(Provider.modelSettings(models.get(Model.ID.make("model"))?.settings)?.websocket).toBe(expected)
-  } finally {
-    await server.stop(true)
-  }
+  const models = CopilotModels.derive(
+    "https://copilot.test",
+    new Map([
+      [
+        "model",
+        {
+          id: "model",
+          name: "Model",
+          version: "2026-10-26",
+          model_picker_enabled: true,
+          supported_endpoints: endpoints,
+          capabilities: {
+            family: "gpt",
+            limits: { max_output_tokens: 1000, max_prompt_tokens: 8000 },
+            supports: { tool_calls: true },
+          },
+        },
+      ],
+    ]),
+    [previous],
+  )
+  expect(Provider.modelSettings(models.get(Model.ID.make("model"))?.settings)?.websocket).toBe(expected)
+  expect(models.get(Model.ID.make("model"))?.package).not.toContain("aisdk")
 })
 
 test("defensively syncs advertised Copilot models", async () => {
@@ -52,7 +54,7 @@ test("defensively syncs advertised Copilot models", async () => {
             id: "gpt-5",
             name: "GPT-5 remote",
             version: "gpt-5-2026-06-01",
-            supported_endpoints: ["/responses", "ws:/responses"],
+            supported_endpoints: ["/responses"],
             billing: {
               token_prices: {
                 batch_size: 0,
@@ -131,12 +133,12 @@ test("defensively syncs advertised Copilot models", async () => {
       ...Model.Info.default(Provider.ID.githubCopilot, Model.ID.make("stale")),
       modelID: Model.ID.make("stale"),
     })
-    const models = await CopilotModels.get(server.url.origin, {}, [existing, stale])
+    const models = await run((http) => CopilotModels.get(http, server.url.origin, {}, [existing, stale]))
     const model = models.get(Model.ID.make("gpt-5"))
 
     expect(model?.name).toBe("GPT-5 local")
-    expect(model?.package).toBe(Provider.aisdk("@ai-sdk/github-copilot"))
-    expect(model?.settings).toMatchObject({ baseURL: server.url.origin, endpoint: "responses", websocket: true })
+    expect(model?.package).toBe("@opencode/ai/providers/openai-compatible-responses")
+    expect(model?.settings).toEqual({ baseURL: server.url.origin })
     expect(model?.cost[0]).toMatchObject({ input: 0, output: 0, cache: { read: 0, write: 0 } })
     expect(model?.variants.map((variant) => variant.id)).toEqual([
       Model.VariantID.make("low"),
@@ -144,10 +146,7 @@ test("defensively syncs advertised Copilot models", async () => {
     ])
     expect(model?.capabilities.input).toEqual(["text", "image", "pdf"])
     expect(models.get(Model.ID.make("claude-sonnet"))?.package).toBe("@opencode/ai/providers/anthropic")
-    expect(models.get(Model.ID.make("claude-sonnet"))?.settings).toMatchObject({
-      baseURL: `${server.url.origin}/v1`,
-      endpoint: "messages",
-    })
+    expect(models.get(Model.ID.make("claude-sonnet"))?.settings).toEqual({ baseURL: `${server.url.origin}/v1` })
     expect(models.get(Model.ID.make("vision-only"))?.capabilities.input).toEqual(["text", "image"])
     expect(models.get(Model.ID.make("utility"))?.enabled).toBe(false)
     expect(models.has(Model.ID.make("stale"))).toBe(false)
@@ -185,7 +184,7 @@ test("prices cache reads from either token price spelling", async () => {
   })
 
   try {
-    const models = await CopilotModels.get(server.url.origin, {}, [])
+    const models = await run((http) => CopilotModels.get(http, server.url.origin, {}, []))
     expect(models.get(Model.ID.make("renamed"))?.cost[0]).toMatchObject({
       input: 2.5,
       output: 15,

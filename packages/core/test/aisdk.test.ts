@@ -1,33 +1,34 @@
 import { APICallError } from "@ai-sdk/provider"
-import { OpenAIResponsesLanguageModel } from "@opencode/core/github-copilot/responses/openai-responses-language-model"
-import { createOpenaiCompatible } from "@opencode/core/github-copilot/copilot-provider"
 import type { LanguageModelV3, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import { AISDK } from "@opencode/core/aisdk"
+import { ModelRetry } from "@opencode/core/model-retry"
 import { SessionRunnerRetry } from "@opencode/core/session/runner/retry"
 import { toSessionError } from "@opencode/core/session/to-session-error"
 import { Model } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
 import {
-  Media,
-  LLM,
+  ai,
   AIError,
   CompactionPart,
-  ProviderID,
   HttpContext,
   InvalidRequestError,
+  isContextOverflowFailure,
   LLMEvent,
+  Media,
   Message,
+  ProviderID,
   RateLimitError,
   TransportError,
   UnknownProviderError,
-  isContextOverflowFailure,
 } from "@opencode/ai/effect"
 import { LLMClient, RequestExecutor } from "@opencode/ai/route"
 import { compileRequest } from "@opencode/ai/testing"
 import { expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import { HttpClientRequest, HttpClientResponse } from "effect/http"
+import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
+import { LayerNodePlatform } from "@opencode/util/effect/app-node-platform"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(AISDK.locationLayer)
@@ -75,182 +76,6 @@ const client = LLMClient.layer.pipe(
   ),
 )
 
-const copilotFinishes = [
-  { normalized: "stop", reason: null },
-  { normalized: "tool-calls", reason: null },
-  { normalized: "length", reason: "max_output_tokens" },
-  { normalized: "content-filter", reason: "content_filter" },
-  { normalized: "unknown", reason: "provider_unmapped" },
-] as const
-
-copilotFinishes.forEach(({ normalized, reason }) =>
-  it.live(`uses Copilot WebSocket Responses and preserves ${normalized}`, () =>
-    Effect.gen(function* () {
-      const requests: unknown[] = []
-      const seen: string[] = []
-      const server = Bun.serve({
-        port: 0,
-        fetch(request, server) {
-          seen.push(request.headers.get("x-hook") ?? "missing")
-          if (request.headers.has("content-length"))
-            return new Response("Unexpected HTTP body framing", { status: 400 })
-          if (server.upgrade(request)) return
-          return new Response(
-            'data: {"type":"response.output_text.delta","item_id":"msg_1","delta":"OK"}\n\n' +
-              'data: {"type":"response.completed","response":{"tools":[{"description":"cut off',
-            { headers: { "content-type": "text/event-stream" } },
-          )
-        },
-        websocket: {
-          message(socket, message) {
-            requests.push(JSON.parse(String(message)))
-            socket.send(
-              JSON.stringify({
-                type: "response.created",
-                response: { id: "resp_1", created_at: 1, model: "api-model" },
-              }),
-            )
-            socket.send(JSON.stringify({ type: "response.output_text.delta", item_id: "msg_1", delta: "OK" }))
-            if (normalized === "tool-calls") {
-              socket.send(
-                JSON.stringify({
-                  type: "response.output_item.added",
-                  output_index: 1,
-                  item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "synthetic_probe" },
-                }),
-              )
-              socket.send(
-                JSON.stringify({
-                  type: "response.function_call_arguments.delta",
-                  item_id: "fc_1",
-                  output_index: 1,
-                  delta: "{}",
-                }),
-              )
-              socket.send(
-                JSON.stringify({
-                  type: "response.output_item.done",
-                  output_index: 1,
-                  item: {
-                    type: "function_call",
-                    id: "fc_1",
-                    call_id: "call_1",
-                    name: "synthetic_probe",
-                    arguments: "{}",
-                  },
-                }),
-              )
-            }
-            socket.send(
-              JSON.stringify({
-                type: reason ? "response.incomplete" : "response.completed",
-                response: {
-                  status: reason ? "incomplete" : "completed",
-                  incomplete_details: reason ? { reason } : null,
-                  usage: { input_tokens: 1, output_tokens: 1 },
-                },
-              }),
-            )
-          },
-        },
-      })
-      yield* Effect.addFinalizer(() => Effect.promise(() => server.stop(true)))
-      const aisdk = yield* AISDK.Service
-      yield* aisdk.hook.sdk((event) => {
-        event.sdk = createOpenaiCompatible(event.options)
-      })
-      yield* aisdk.hook.language((event) => {
-        event.language = event.sdk.responses("api-model")
-      })
-      const resolved = yield* aisdk.model({
-        ...model(
-          "@ai-sdk/github-copilot",
-          Provider.modelSettings({
-            baseURL: server.url.origin,
-            apiKey: "test",
-            websocket: true,
-          }),
-        ),
-        providerID: Provider.ID.githubCopilot,
-      })
-      const response = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" }), {
-        http: (request, handler) => handler(HttpClientRequest.setHeader(request, "x-hook", "applied")),
-      }).pipe(Effect.provide(client))
-      expect(seen).toEqual(["applied"])
-      expect(requests).toEqual([
-        expect.objectContaining({
-          type: "response.create",
-          model: "api-model",
-          initiator: "user",
-        }),
-      ])
-      expect(requests[0]).not.toHaveProperty("stream")
-      expect(response.finishReason.normalized).toBe(normalized)
-      expect(response.finishReason.raw).toBe(reason ?? undefined)
-      expect(response.events.filter(LLMEvent.is.textDelta).map((event) => event.text)).toEqual(["OK"])
-    }),
-  ),
-)
-
-const finishCases = [
-  ["stop", "stop", "stop"],
-  ["tool-calls", "tool_calls", "tool-calls"],
-  ["length", "max_output_tokens", "length"],
-  ["content-filter", "content_filter", "content-filter"],
-  ["other", "provider_unmapped", "unknown"],
-  ["other", undefined, "unknown"],
-] as const
-
-finishCases.forEach(([unified, raw, normalized]) => {
-  it.effect(`preserves AI SDK finish ${unified} with raw ${raw}`, () =>
-    Effect.gen(function* () {
-      const aisdk = yield* AISDK.Service
-      yield* aisdk.hook.sdk((event) => {
-        event.sdk = { languageModel: () => streamModel([{ type: "finish", finishReason: { unified, raw }, usage }]) }
-      })
-      const resolved = yield* aisdk.model(model("test-ai-sdk"))
-      const response = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" })).pipe(
-        Effect.provide(client),
-      )
-      expect(response.finishReason).toEqual({ normalized, raw })
-    }),
-  )
-})
-
-it.effect("does not retry a cleanly closed but malformed Copilot response", () =>
-  Effect.gen(function* () {
-    const aisdk = yield* AISDK.Service
-    yield* aisdk.hook.sdk((event) => {
-      event.sdk = {
-        languageModel: () =>
-          new OpenAIResponsesLanguageModel("test", {
-            provider: "copilot",
-            headers: () => ({}),
-            url: () => "https://example.test/responses",
-            fetch: Object.assign(
-              async () =>
-                new Response(
-                  'data: {"type":"response.output_text.delta","item_id":"msg_1","delta":"OK"}\n\n' +
-                    'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1"}}\n\n' +
-                    'data: {"type":"response.completed","response":{"status":"completed","tools":[{"description":"cut off',
-                  { headers: { "content-type": "text/event-stream" } },
-                ),
-              { preconnect: fetch.preconnect },
-            ),
-          }),
-      }
-    })
-    const resolved = yield* aisdk.model(model("test-ai-sdk"))
-    const error = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" })).pipe(
-      Effect.provide(client),
-      Effect.flip,
-    )
-    expect(error.reason._tag).toBe("InvalidProviderOutput")
-    expect(error.message).toContain("without response.completed or response.incomplete")
-    expect(SessionRunnerRetry.isRetryable(error)).toBe(false)
-  }),
-)
-
 it.effect("rejects native provider compaction rather than silently dropping replay state", () =>
   Effect.gen(function* () {
     const aisdk = yield* AISDK.Service
@@ -259,7 +84,7 @@ it.effect("rejects native provider compaction rather than silently dropping repl
     })
     const resolved = yield* aisdk.model(model("@ai-sdk/openai"))
     const error = yield* compileRequest(
-      LLM.request({
+      ai.request({
         model: resolved,
         messages: [
           Message.assistant(
@@ -328,7 +153,7 @@ it.effect("uses canonical names and metadata without merging connection cache pa
     expect(resolved).toMatchObject({ id: "api-model", provider: "openai" })
     expect(resolved.route).toMatchObject({ provider: "openai", providerMetadataKey: "openai" })
     expect(resolved.route.model({ id: "another-model" })).toMatchObject({ provider: "openai" })
-    const prepared = yield* compileRequest(LLM.request({ model: resolved, prompt: "Hello" }))
+    const prepared = yield* compileRequest(ai.request({ model: resolved, prompt: "Hello" }))
     expect(prepared.body.providerOptions).toEqual({ openai: { reasoningEffort: "high" } })
   }),
 )
@@ -359,7 +184,7 @@ it.effect("projects request settings, headers, and body overlays", () =>
       body: { safety_setting: "strict" },
     })
     const prepared = yield* compileRequest(
-      LLM.request({
+      ai.request({
         model: resolved,
         prompt: "Hello",
         providerOptions: { safetySettings: [{ category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" }] },
@@ -418,7 +243,7 @@ it.effect("lowers chronological system updates to wrapped user messages", () =>
 
     const resolved = yield* aisdk.model(model("opaque-provider"))
     const prepared = yield* compileRequest(
-      LLM.request({
+      ai.request({
         model: resolved,
         system: "Initial instructions.",
         messages: [
@@ -457,7 +282,7 @@ it.effect("leaves max output tokens unset when the request omits them", () =>
       ...model("@openrouter/ai-sdk-provider"),
       limit: { context: 500_000, output: 500_000 },
     })
-    const prepared = yield* compileRequest(LLM.request({ model: resolved, prompt: "Hello" }))
+    const prepared = yield* compileRequest(ai.request({ model: resolved, prompt: "Hello" }))
 
     expect(prepared.body.maxOutputTokens).toBeUndefined()
   }),
@@ -476,7 +301,7 @@ it.effect("maps pro reasoning bodies to AI SDK provider options", () =>
       ...model("@ai-sdk/openai"),
       body: { reasoning: { mode: "pro" } },
     })
-    const prepared = yield* compileRequest(LLM.request({ model: resolved, prompt: "Hello" }))
+    const prepared = yield* compileRequest(ai.request({ model: resolved, prompt: "Hello" }))
 
     expect(body).toBeUndefined()
     expect(prepared.body.providerOptions).toEqual({
@@ -493,7 +318,6 @@ it.effect("maps package-specific AI SDK provider option keys", () =>
     })
 
     const cases = [
-      ["@ai-sdk/github-copilot", "copilot", { reasoningEffort: "high" }],
       ["@ai-sdk/amazon-bedrock/mantle", "openai", { reasoningEffort: "high", forceReasoning: true }],
       ["@ai-sdk/openai-compatible", "test-provider", { reasoningEffort: "high" }],
       ["@jerome-benoit/sap-ai-provider-v2", "sap-ai", { reasoningEffort: "high" }],
@@ -501,7 +325,7 @@ it.effect("maps package-specific AI SDK provider option keys", () =>
     ] as const
     for (const [packageName, key, settings] of cases) {
       const resolved = yield* aisdk.model(model(packageName, { reasoningEffort: "high" }))
-      const prepared = yield* compileRequest(LLM.request({ model: resolved, prompt: "Hello" }))
+      const prepared = yield* compileRequest(ai.request({ model: resolved, prompt: "Hello" }))
       expect(prepared.body.providerOptions).toEqual({ [key]: settings })
     }
   }),
@@ -515,13 +339,13 @@ it.effect("forces reasoning and projects both Azure AI SDK namespaces", () =>
     })
 
     const openai = yield* aisdk.model(model("@ai-sdk/openai", { reasoningEffort: "high" }))
-    const openaiPrepared = yield* compileRequest(LLM.request({ model: openai, prompt: "Hello" }))
+    const openaiPrepared = yield* compileRequest(ai.request({ model: openai, prompt: "Hello" }))
     expect(openaiPrepared.body.providerOptions).toEqual({
       openai: { reasoningEffort: "high", forceReasoning: true },
     })
 
     const azure = yield* aisdk.model(model("@ai-sdk/azure", { reasoningEffort: "high" }))
-    const azurePrepared = yield* compileRequest(LLM.request({ model: azure, prompt: "Hello" }))
+    const azurePrepared = yield* compileRequest(ai.request({ model: azure, prompt: "Hello" }))
     expect(azurePrepared.body.providerOptions).toEqual({
       openai: { reasoningEffort: "high", forceReasoning: true },
       azure: { reasoningEffort: "high", forceReasoning: true },
@@ -543,7 +367,7 @@ it.effect("routes AI Gateway model options by upstream prefix", () =>
       }),
       modelID: Model.ID.make("anthropic/claude-sonnet-5"),
     })
-    const anthropicPrepared = yield* compileRequest(LLM.request({ model: anthropic, prompt: "Hello" }))
+    const anthropicPrepared = yield* compileRequest(ai.request({ model: anthropic, prompt: "Hello" }))
     expect(anthropicPrepared.body.providerOptions).toEqual({
       gateway: { order: ["anthropic"] },
       anthropic: { thinking: { type: "adaptive" } },
@@ -553,7 +377,7 @@ it.effect("routes AI Gateway model options by upstream prefix", () =>
       ...model("@ai-sdk/gateway", { reasoningConfig: { type: "enabled" } }),
       modelID: Model.ID.make("amazon/nova-2-lite"),
     })
-    const bedrockPrepared = yield* compileRequest(LLM.request({ model: bedrock, prompt: "Hello" }))
+    const bedrockPrepared = yield* compileRequest(ai.request({ model: bedrock, prompt: "Hello" }))
     expect(bedrockPrepared.body.providerOptions).toEqual({
       bedrock: { reasoningConfig: { type: "enabled" } },
     })
@@ -563,7 +387,7 @@ it.effect("routes AI Gateway model options by upstream prefix", () =>
       modelID: Model.ID.make("openai/gpt-5.5"),
     })
     const openaiPrepared = yield* compileRequest(
-      LLM.request({ model: openai, prompt: "Hello", providerOptions: { textVerbosity: "low" } }),
+      ai.request({ model: openai, prompt: "Hello", providerOptions: { textVerbosity: "low" } }),
     )
     expect(openaiPrepared.body.providerOptions).toEqual({
       gateway: { order: ["openai"] },
@@ -574,7 +398,7 @@ it.effect("routes AI Gateway model options by upstream prefix", () =>
       ...model("@ai-sdk/gateway", { reasoningEffort: "high" }),
       modelID: Model.ID.make("deepseek/deepseek-v4"),
     })
-    const fallbackPrepared = yield* compileRequest(LLM.request({ model: fallback, prompt: "Hello" }))
+    const fallbackPrepared = yield* compileRequest(ai.request({ model: fallback, prompt: "Hello" }))
     expect(fallbackPrepared.body.providerOptions).toEqual({
       deepseek: { reasoningEffort: "high" },
     })
@@ -600,7 +424,7 @@ it.effect("closes the open AI SDK reasoning part when the next one starts", () =
     })
 
     const resolved = yield* aisdk.model(model("@ai-sdk/gateway"))
-    const response = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Think" })).pipe(
+    const response = yield* LLMClient.generate(ai.request({ model: resolved, prompt: "Think" })).pipe(
       Effect.provide(client),
     )
 
@@ -642,7 +466,7 @@ it.effect("normalizes repeated, reopened, and overlapping AI SDK fragment bounda
     })
 
     const resolved = yield* aisdk.model(model("@ai-sdk/gateway"))
-    const response = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Think" })).pipe(
+    const response = yield* LLMClient.generate(ai.request({ model: resolved, prompt: "Think" })).pipe(
       Effect.provide(client),
     )
 
@@ -675,7 +499,7 @@ it.effect("projects replay metadata onto AI SDK prompt parts", () =>
     const resolved = yield* aisdk.model(model("@ai-sdk/anthropic"))
     expect(resolved.route.providerMetadataKey).toBe("anthropic")
     const prepared = yield* compileRequest(
-      LLM.request({
+      ai.request({
         model: resolved,
         messages: [
           Message.assistant([
@@ -738,7 +562,7 @@ it.effect("normalizes file data across AI SDK prompt parts", () =>
     const resolved = yield* aisdk.model(model("opaque-provider"))
     const bytes = new Uint8Array([0, 1, 2, 3])
     const prepared = yield* compileRequest(
-      LLM.request({
+      ai.request({
         model: resolved,
         messages: [
           Message.user([
@@ -859,7 +683,7 @@ it.effect("does not treat SSE comment heartbeats as model progress", () =>
         fetch: customFetch,
       }),
     )
-    const result = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" })).pipe(
+    const result = yield* LLMClient.generate(ai.request({ model: resolved, prompt: "Hello" })).pipe(
       Effect.provide(client),
       Effect.result,
       Effect.ensuring(
@@ -899,6 +723,38 @@ const compatibleModel = Effect.fn(function* (customFetch: typeof fetch) {
   )
 })
 
+// Not `it`, whose AISDK layer is already built with the harness's fetch and would be reused here.
+testEffect(Layer.empty).effect("sends AI SDK requests through the embedder's fetch when the provider names none", () =>
+  Effect.gen(function* () {
+    const sent: string[] = []
+    const embedder = async (input: Request | string | URL) => {
+      sent.push(input instanceof Request ? input.url : String(input))
+      return new Response(chatChunk("embedded"), { headers: { "content-type": "text/event-stream" } })
+    }
+    const response = yield* Effect.gen(function* () {
+      const aisdk = yield* AISDK.Service
+      yield* aisdk.hook.sdk((event) => {
+        event.sdk = createOpenAICompatible({
+          ...event.options,
+          name: String(event.options.name),
+          baseURL: String(event.options.baseURL),
+        })
+      })
+      const resolved = yield* aisdk.model(
+        model("@ai-sdk/openai-compatible", { apiKey: "test", baseURL: "https://example.test/v1" }),
+      )
+      return yield* LLMClient.generate(ai.request({ model: resolved, prompt: "Hello" })).pipe(Effect.provide(client))
+    }).pipe(
+      Effect.provide(
+        AppNodeBuilder.build(AISDK.node, [LayerNodePlatform.httpFetch.replace(LayerNodePlatform.fetchLayer(embedder))]),
+      ),
+    )
+
+    expect(sent).toEqual(["https://example.test/v1/chat/completions"])
+    expect(response.text).toBe("embedded")
+  }),
+)
+
 it.effect("routes AI SDK requests and responses through HTTP hook middleware", () =>
   Effect.gen(function* () {
     const sent: Array<{ url: string; headers: Headers; body: string }> = []
@@ -916,7 +772,7 @@ it.effect("routes AI SDK requests and responses through HTTP hook middleware", (
       ),
     )
     const seen: string[] = []
-    const response = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" }), {
+    const response = yield* LLMClient.generate(ai.request({ model: resolved, prompt: "Hello" }), {
       http: (request, handler) =>
         Effect.gen(function* () {
           // Read the body twice the way session hooks do, to prove it is not a single-use stream.
@@ -956,7 +812,7 @@ it.effect("sends AI SDK requests directly when no HTTP hook middleware is attach
         { preconnect: fetch.preconnect },
       ),
     )
-    const response = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" })).pipe(
+    const response = yield* LLMClient.generate(ai.request({ model: resolved, prompt: "Hello" })).pipe(
       Effect.provide(client),
     )
     expect(bodies).toHaveLength(1)
@@ -990,7 +846,7 @@ it.effect("fails with a retryable transport error when response headers time out
         fetch: customFetch,
       }),
     )
-    const error = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" })).pipe(
+    const error = yield* LLMClient.generate(ai.request({ model: resolved, prompt: "Hello" })).pipe(
       Effect.provide(client),
       Effect.flip,
     )
@@ -1022,7 +878,7 @@ it.effect("emits malformed AI SDK tool input without executing it", () =>
     })
 
     const resolved = yield* aisdk.model(model("test-ai-sdk"))
-    const response = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Lookup" })).pipe(
+    const response = yield* LLMClient.generate(ai.request({ model: resolved, prompt: "Lookup" })).pipe(
       Effect.provide(client),
     )
 
@@ -1060,7 +916,7 @@ it.effect("keeps malformed provider-executed AI SDK input terminal", () =>
     })
 
     const resolved = yield* aisdk.model(model("hosted-test-ai-sdk"))
-    const error = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Search" })).pipe(
+    const error = yield* LLMClient.generate(ai.request({ model: resolved, prompt: "Search" })).pipe(
       Effect.provide(client),
       Effect.flip,
     )
@@ -1088,7 +944,7 @@ const streamFailure = (failure: unknown, streamed = false) =>
       }
     })
     const resolved = yield* aisdk.model(model("test-ai-sdk"))
-    return yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" })).pipe(
+    return yield* LLMClient.generate(ai.request({ model: resolved, prompt: "Hello" })).pipe(
       Effect.provide(client),
       Effect.flip,
     )
@@ -1339,6 +1195,21 @@ it.effect("classifies native fetch failures as request transport errors", () =>
     expect(error.message).toBe("connect ECONNREFUSED 127.0.0.1:443")
     expect(error.reason.cause).toBe(cause)
     expect(SessionRunnerRetry.isRetryable(error)).toBeTrue()
+  }),
+)
+
+it.effect("keeps the code of a host name that didn't resolve", () =>
+  Effect.gen(function* () {
+    const dns = Object.assign(new Error("getaddrinfo ENOTFOUND api.example.com"), { code: "ENOTFOUND" })
+    const raw = yield* streamFailure(dns)
+    expect(raw.reason).toMatchObject({ _tag: "Transport", operation: "request", code: "ENOTFOUND" })
+    expect(ModelRetry.isUnreachable(raw)).toBeTrue()
+
+    const wrapped = yield* streamFailure(
+      apiCallError({ message: "Cannot connect to API: getaddrinfo ENOTFOUND", isRetryable: true, cause: dns }),
+    )
+    expect(wrapped.reason).toMatchObject({ _tag: "Transport", operation: "request", code: "ENOTFOUND" })
+    expect(ModelRetry.isUnreachable(wrapped)).toBeTrue()
   }),
 )
 

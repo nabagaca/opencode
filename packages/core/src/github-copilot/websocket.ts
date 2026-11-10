@@ -1,119 +1,99 @@
 export * as CopilotWebSocket from "./websocket.js"
 
-import { InvalidResponseDataError } from "@ai-sdk/provider"
-import { WebSocketTransport } from "@opencode/ai/route"
-import { Cause, Effect, Exit, Schema, Stream } from "effect"
+import { AIError, TransportError } from "@opencode/ai/effect"
+import { OpenResponsesChannel } from "@opencode/ai/protocols"
+import { WebSocketTransport, type WebSocketRequest, type Transport } from "@opencode/ai/route"
+import { Clock, Effect, Schema, Stream } from "effect"
 import { Headers } from "effect/http"
+import { Socket } from "effect/socket"
 
-const decodeBody = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Record(Schema.String, Schema.Json)))
-const decodeEvent = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Struct({ type: Schema.String })))
-const terminal = new Set(["response.completed", "response.incomplete", "response.failed", "error"])
+const channel = OpenResponsesChannel.transport({
+  id: "github-copilot",
+  name: "GitHub Copilot Responses",
+  // Preserve the fork's full-history requests rather than adding response-ID continuation during the merge.
+  continuation: () => undefined,
+})
 
-export const request = make({ pingInterval: 15_000, staleAfter: 60_000 })
-
-// Preserve the existing Copilot adapter and HTTP hooks by presenting WebSocket events as SSE.
-export function make(liveness: { pingInterval: number; staleAfter: number }) {
-  return async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-    const request = input instanceof Request ? new Request(input, init) : new Request(String(input), init)
-    const body = decodeBody(await request.clone().text())
-    if (body.stream !== true) return fetch(request)
-    // HTTP hooks may have framed the POST body; the upgrade has no HTTP body.
-    request.headers.delete("content-length")
-    request.headers.delete("transfer-encoding")
-    const url = new URL(request.url)
-    url.protocol = url.protocol === "https:" ? "wss:" : "ws:"
-    const controller = new AbortController()
-    const signal = AbortSignal.any([request.signal, controller.signal])
-    const socket = new WebSocket(url, { headers: Object.fromEntries(request.headers) })
-    const opened = await Effect.runPromiseExit(
-      Effect.gen(function* () {
-        const connection = yield* WebSocketTransport.fromWebSocket(socket, {
-          url: url.href,
-          headers: Headers.fromInput(request.headers),
-        })
-        const { stream, ...fields } = body
-        yield* connection
-          .sendText(
-            JSON.stringify({
-              type: "response.create",
-              ...fields,
-              initiator: request.headers.get("x-initiator") ?? "user",
-            }),
-          )
-          .pipe(Effect.onError(() => connection.close))
-        return connection
+export const transport: Transport.Transport<unknown, OpenResponsesChannel.Prepared, string> = {
+  ...channel,
+  prepare: (input) =>
+    channel.prepare(input).pipe(
+      Effect.map((prepared) => {
+        if (!prepared.channel) return prepared
+        const vision = input.request.messages.some((message) =>
+          message.content.some(
+            (part) =>
+              (part.type === "media" && part.media.kind === "image") ||
+              (part.type === "tool-result" &&
+                part.result.type === "content" &&
+                part.result.value.some((item) => item.type === "file" && item.mime.startsWith("image/"))),
+          ),
+        )
+        return vision
+          ? {
+              ...prepared,
+              channel: {
+                ...prepared.channel,
+                headers: Headers.set(prepared.channel.headers, "Copilot-Vision-Request", "true"),
+              },
+            }
+          : prepared
       }),
-      { signal },
-    )
-    if (Exit.isFailure(opened)) throw Cause.squash(opened.cause)
-    const connection = opened.value
-    const encoder = new TextEncoder()
-    const decoder = new TextDecoder()
-    return new Response(
-      new ReadableStream<Uint8Array>({
-        start(output) {
-          const abort = () => output.error(signal.reason)
-          signal.addEventListener("abort", abort, { once: true })
-          // A socket dropped by a proxy or VPN may never emit close, so ping it and treat silence as a dead connection.
-          let seen = Date.now()
-          const alive = () => {
-            seen = Date.now()
-          }
-          socket.addEventListener("message", alive)
-          socket.addEventListener("pong", alive)
-          const monitor = setInterval(() => {
-            if (Date.now() - seen < liveness.staleAfter) {
-              if (socket.readyState === WebSocket.OPEN) socket.ping()
-              return
-            }
-            controller.abort(
-              Object.assign(new Error(`Copilot WebSocket stopped responding for ${liveness.staleAfter / 1000}s`), {
-                code: "ETIMEDOUT",
-              }),
-            )
-          }, liveness.pingInterval)
-          const stop = () => {
-            clearInterval(monitor)
-            socket.removeEventListener("message", alive)
-            socket.removeEventListener("pong", alive)
-          }
-          const events = connection.messages.pipe(
-            Stream.mapEffect((message) =>
-              Effect.try({
-                try: () => {
-                  const text = WebSocketTransport.messageText(message, decoder)
-                  return { text, type: decodeEvent(text).type }
-                },
-                catch: (cause) =>
-                  new InvalidResponseDataError({
-                    message: "Invalid Copilot WebSocket response event",
-                    data: { event: message, cause },
-                  }),
-              }),
-            ),
-            Stream.takeUntil((event) => terminal.has(event.type)),
-            Stream.runForEach((event) => Effect.sync(() => output.enqueue(encoder.encode(`data: ${event.text}\n\n`)))),
-            Effect.ensuring(connection.close),
-          )
-          void Effect.runPromiseExit(events, { signal }).then((exit) => {
-            stop()
-            signal.removeEventListener("abort", abort)
-            if (signal.aborted) {
-              output.error(signal.reason)
-              return
-            }
-            if (Exit.isFailure(exit)) {
-              output.error(Cause.squash(exit.cause))
-              return
-            }
-            output.close()
-          })
-        },
-        cancel(reason) {
-          controller.abort(reason)
-        },
-      }),
-      { headers: { "content-type": "text/event-stream" } },
-    )
-  }
+    ),
 }
+
+const frame = Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown))
+const decodeFrame = Schema.decodeUnknownSync(frame)
+const encodeFrame = Schema.encodeSync(frame)
+
+export const initiate = (message: string, agent = false) => {
+  const body = decodeFrame(message)
+  const input = Array.isArray(body.input) ? body.input : []
+  const last = input.at(-1)
+  return encodeFrame({
+    ...body,
+    initiator:
+      !agent && typeof last === "object" && last !== null && "role" in last && last.role === "user" ? "user" : "agent",
+  })
+}
+
+// Keep proxy/VPN blackholes bounded without timing out a healthy peer that is still reasoning.
+export const open = (input: WebSocketRequest, liveness = { pingInterval: 15_000, staleAfter: 60_000 }) =>
+  Effect.gen(function* () {
+    const constructor = yield* Socket.WebSocketConstructor
+    const clock = yield* Clock.Clock
+    const socket = constructor(input.url, { headers: input.headers })
+    const connection = yield* WebSocketTransport.fromWebSocket(socket, input)
+    if (!(socket instanceof WebSocket) || !("ping" in socket) || typeof socket.ping !== "function") return connection
+    const ping = socket.ping.bind(socket)
+    let seen = clock.currentTimeMillisUnsafe()
+    const alive = () => {
+      seen = clock.currentTimeMillisUnsafe()
+    }
+    socket.addEventListener("message", alive)
+    socket.addEventListener("pong", alive)
+    const monitor = Effect.gen(function* () {
+      yield* Effect.sleep(liveness.pingInterval)
+      if (clock.currentTimeMillisUnsafe() - seen >= liveness.staleAfter)
+        return yield* new AIError({
+          reason: new TransportError({
+            message: `Copilot WebSocket stopped responding for ${liveness.staleAfter / 1000}s`,
+            transport: "websocket",
+            operation: "read",
+            phase: "receive",
+            code: "ETIMEDOUT",
+          }),
+        })
+      yield* Effect.sync(() => {
+        if (socket.readyState === WebSocket.OPEN) ping()
+      })
+    }).pipe(Effect.forever)
+    return {
+      ...connection,
+      messages: connection.messages.pipe(Stream.merge(Stream.fromEffectDrain(monitor), { haltStrategy: "left" })),
+      close: Effect.sync(() => {
+        socket.removeEventListener("message", alive)
+        socket.removeEventListener("pong", alive)
+      }).pipe(Effect.andThen(connection.close)),
+    }
+  })
